@@ -44,7 +44,7 @@ Ahora trabajaremos dentro de la terminal de **Ubuntu**.
     ```
 4.  Cierra el terminal
 
-# 4. Clonar el Proyecto desde GitHub
+## 4. Clonar el Proyecto desde GitHub
 Descargaremos el repositorio desde ubuntu. En la terminal de Ubuntu, ejecuta:
 
 1.  Ve a tu directorio principal y clona el repositorio:
@@ -109,4 +109,5 @@ Dado que el algoritmo PRESENT requiere ver bits individuales, usaremos GDB con G
 
 ---
 **¡Listo!**
+
 
