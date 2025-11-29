@@ -39,36 +39,49 @@ section .text
     global _start
 
 _start:
-    ; --- TEST FASE 2 ---
+    ; --- TEST FASE 3: Key Schedule ---
     
-    ; 1. Test SBoxLayer
-    ; Entrada: 0 (Todo ceros)
-    ; Esperado: Cada nibble 0 se convierte en C (1100). 
-    ; Resultado esperado: 0xCCCCCCCCCCCCCCCC
-    mov rax, 0
-    call sBoxLayer
+    ; 1. Cargar una clave maestra (usaremos todo ceros para prueba simple)
+    ; Ojo: En un caso real, carga datos aquí.
+    lea rdi, [master_key]
+    mov qword [rdi], 0      ; Primeros 8 bytes = 0
+    mov word [rdi+8], 0     ; Últimos 2 bytes = 0
+
+    ; 2. Generar subclaves
+    call generate_round_keys
     
-    ; Imprimir resultado SBox
-    mov r12, rax            ; Guardamos resultado para usarlo luego
-    call print_hex          ; Debería imprimir CCCCCCCCCCCCCCCC
+    ; 3. Imprimir algunas claves para verificar
+    mov rax, 1
+    mov rdi, 1
+    lea rsi, [msg_start]    ; "Iniciando..."
+    mov rdx, len_msg_start
+    syscall
+
+    ; Imprimir dato de master_key
+    mov rax, [master_key]
+    call print_hex          ; Esperado: 0000000000000000
+    mov word rax, [master_key+8]
+    call print_hex          ; Esperado: 0000000000000000
+
+    ; Imprimir Subclave 1 (Debería ser 00...00)
+    lea rsi, [round_keys]
+    mov rax, [rsi]
+    call print_hex          ; Esperado: 0000000000000000
+
+    ; Imprimir Subclave 2 (Debería ser distinta)
+    ; El algoritmo habrá rotado y sumado el contador (1).
+    ; Veamos qué sale.
+    mov rax, [rsi + 8]      ; Siguiente qword
+    call print_hex          
     
-    ; 2. Test pLayer
-    ; Vamos a permutar el resultado anterior (CCCCCCCCCCCCCCCC)
-    ; Esto es difícil de verificar mentalmente, probemos un bit simple primero.
-    
-    ; REINICIO PARA TEST pLayer simple
-    ; Bit 1 encendido (0x00...02) -> Debería ir a pos 16 (0x00...10000)
-    mov rax, 2              ; Bit 1 encendido
-    call pLayer
-    call print_hex          ; Debería imprimir 0000000000010000
+    ; Imprimir Subclave 31
+    mov rax, [rsi + 240]    ; 30 * 8 bytes offset
+    call print_hex
 
     ; Salir
     mov rax, 60
     xor rdi, rdi
     syscall
-
-
-
 
 
 
@@ -276,3 +289,91 @@ pLayer:
     mov rax, rcx            ; Resultado final a RAX
     ret
 
+
+; -----------------------------------------------------------------------------
+; Subrutina: generate_round_keys
+; Descripción: Genera las 32 subclaves usando Rotación a la Izquierda Estándar.
+; Entrada: master_key (en memoria .bss)
+; Salida: round_keys (relleno en memoria .bss)
+; -----------------------------------------------------------------------------
+generate_round_keys:
+    ; Cargar clave inicial
+    lea rsi, [master_key]
+    mov rax, [rsi]          ; Low 64 bits
+    movzx rdx, word [rsi+8] ; High 16 bits
+
+    lea rdi, [round_keys]   ; Buffer de destino
+    mov rcx, 1              ; Contador de ronda (1 a 31)
+
+.key_loop:
+    ; --- PASO A: Guardar Subclave (Bits 79..16) ---
+    mov r8, rdx
+    shl r8, 48              ; RDX a tope
+    mov r9, rax
+    shr r9, 16              ; RAX quitando los 16 bajos
+    or r8, r9
+    mov [rdi], r8           ; Guardar K_i
+    add rdi, 8
+
+    cmp rcx, 32
+    je .done
+
+    ; --- PASO B: Rotación Estándar a la Izquierda 61 bits ---
+    ; K = (K << 61) | (K >> 19) en 80 bits.
+    ; Lo hacemos manual sobre RDX:RAX.
+    
+    ; Guardamos copias originales porque vamos a destruir los registros
+    mov r8, rax             ; r8 = Old Low
+    mov r9, rdx             ; r9 = Old High
+
+    ; 1. Calcular NUEVO RDX (High 16 bits)
+    ; Vienen de los bits 18..3 del Old Low.
+    mov rdx, r8
+    shr rdx, 3              ; Desplazar para que el bit 3 quede en 0
+    and rdx, 0xFFFF         ; Máscara para quedarnos solo con 16 bits
+
+    ; 2. Calcular NUEVO RAX (Low 64 bits)
+    ; Se compone de 3 partes unidas con OR:
+    
+    ; Parte 1: Los bits 2..0 de Old Low van al tope (bits 63..61)
+    mov r10, r8
+    shl r10, 61
+    
+    ; Parte 2: Los 16 bits de Old High van a continuación (bits 60..45)
+    mov r11, r9
+    shl r11, 45
+    
+    ; Parte 3: Los bits 63..19 de Old Low van al fondo (bits 44..0)
+    shr r8, 19              ; Usamos r8 directo (ya no necesitamos el valor original)
+    
+    ; Unir todo en RAX
+    mov rax, r10
+    or rax, r11
+    or rax, r8
+
+    ; --- PASO C: S-Box en los 4 bits superiores (bits 79..76) ---
+    ; Ahora están en RDX bits 15..12
+    mov rbx, rdx
+    shr rbx, 12             ; Bajar a 3..0
+    and rbx, 0x0F           ; Aislar
+
+    lea rsi, [sbox]
+    mov bl, [rsi + rbx]     ; Sustitución S-Box
+
+    ; Reinsertar en RDX
+    and rdx, 0x0FFF         ; Limpiar los 4 bits altos
+    shl rbx, 12             ; Subir el resultado
+    or rdx, rbx             ; Pegar
+
+    ; --- PASO D: XOR con Round Counter (bits 19..15 de K) ---
+    ; En nuestra estructura RDX:RAX, los bits 19..15 caen dentro de RAX.
+    ; Específicamente en los bits 19..15 de RAX.
+    mov r8, rcx
+    shl r8, 15
+    xor rax, r8
+
+    inc rcx
+    jmp .key_loop
+
+.done:
+    ret
