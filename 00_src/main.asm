@@ -7,6 +7,11 @@
 section .data
     ; --- TABLAS CRIPTOGRÁFICAS ---
     sbox db 0xC, 0x5, 0x6, 0xB, 0x9, 0x0, 0xA, 0xD, 0x3, 0xE, 0xF, 0x8, 0x4, 0x7, 0x1, 0x2
+
+    pbox db 0, 16, 32, 48, 1, 17, 33, 49, 2, 18, 34, 50, 3, 19, 35, 51
+         db 4, 20, 36, 52, 5, 21, 37, 53, 6, 22, 38, 54, 7, 23, 39, 55
+         db 8, 24, 40, 56, 9, 25, 41, 57, 10, 26, 42, 58, 11, 27, 43, 59
+         db 12, 28, 44, 60, 13, 29, 45, 61, 14, 30, 46, 62, 15, 31, 47, 63
     
     ; --- DATOS DE PRUEBA (MODIFICABLE) ---
     ; Puedes cambiar el texto entre comillas. El programa se ajustará solo.
@@ -327,30 +332,23 @@ sBoxLayer:
 
 ; --- CAPA P-LAYER ---
 pLayer:
-    mov r10, rax
-    xor rcx, rcx
-    xor r8, r8
+    xor rcx, rcx        ; Acumulador para el resultado
+    xor rdx, rdx        ; Índice de bit (0..63)
+    lea rsi, [pbox]     ; Tabla de permutación
+
 .ploop:
-    bt r10, r8
-    jnc .pnext
-    cmp r8, 63
-    je .p63
-    mov rax, r8
-    shl rax, 4
-    mov rbx, 63
-    xor rdx, rdx
-    div rbx
-    mov r9, rdx
-    jmp .pset
-.p63:
-    mov r9, 63
-.pset:
-    bts rcx, r9
-.pnext:
-    inc r8
-    cmp r8, 64
+    bt rax, rdx         ; ¿Bit RDX encendido en entrada (RAX)?
+    jnc .skip           ; Si no, saltar
+
+    movzx rbx, byte [rsi + rdx] ; Obtener nueva posición desde pbox
+    bts rcx, rbx        ; Encender bit en la nueva posición
+
+.skip:
+    inc rdx
+    cmp rdx, 64
     jl .ploop
-    mov rax, rcx
+
+    mov rax, rcx        ; Retornar resultado
     ret
 
 ; --- UTILIDAD: PRINT HEX ---
