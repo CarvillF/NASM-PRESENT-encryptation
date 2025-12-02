@@ -7,11 +7,17 @@
 section .data
     ; --- TABLAS CRIPTOGRÁFICAS ---
     sbox db 0xC, 0x5, 0x6, 0xB, 0x9, 0x0, 0xA, 0xD, 0x3, 0xE, 0xF, 0x8, 0x4, 0x7, 0x1, 0x2
+    inv_sbox db 0x5, 0xE, 0xF, 0x8, 0xC, 0x1, 0x2, 0xD, 0xB, 0x4, 0x6, 0x3, 0x0, 0x7, 0x9, 0xA
 
     pbox db 0, 16, 32, 48, 1, 17, 33, 49, 2, 18, 34, 50, 3, 19, 35, 51
          db 4, 20, 36, 52, 5, 21, 37, 53, 6, 22, 38, 54, 7, 23, 39, 55
          db 8, 24, 40, 56, 9, 25, 41, 57, 10, 26, 42, 58, 11, 27, 43, 59
          db 12, 28, 44, 60, 13, 29, 45, 61, 14, 30, 46, 62, 15, 31, 47, 63
+
+    inv_pbox db 0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 60
+             db 1, 5, 9, 13, 17, 21, 25, 29, 33, 37, 41, 45, 49, 53, 57, 61
+             db 2, 6, 10, 14, 18, 22, 26, 30, 34, 38, 42, 46, 50, 54, 58, 62
+             db 3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43, 47, 51, 55, 59, 63
     
     ; --- DATOS DE PRUEBA (MODIFICABLE) ---
     ; Puedes cambiar el texto entre comillas. El programa se ajustará solo.
@@ -32,6 +38,9 @@ section .data
 
     msg_res  db "[*] Resultado Cifrado (Hexadecimal):", 10, 0
     len_msg_res equ $ - msg_res
+
+    msg_dec_res db 10, "[*] Resultado Descifrado (Texto): ", 0
+    len_msg_dec_res equ $ - msg_dec_res
     
     newline db 10, 0
 
@@ -44,6 +53,7 @@ section .bss
     
     plaintext resb 256     ; Buffer entrada
     ciphertext resb 256    ; Buffer salida
+    decrypted_text resb 256 ; Buffer descifrado
 
 section .text
     global _start
@@ -141,6 +151,7 @@ _start:
 
     ; Bucle para imprimir TODOS los bloques cifrados
     pop rax                         ; Recuperar longitud total en bytes
+    push rax                        ; Guardarla de nuevo para el descifrado
     shr rax, 3                      ; Convertir a número de bloques
     mov rcx, rax                    ; Usar como contador del bucle
     lea rsi, [ciphertext]           ; Puntero al inicio del resultado
@@ -158,6 +169,46 @@ _start:
     add rsi, 8                      ; Avanzar al siguiente bloque
     dec rcx                         
     jnz .print_loop                 ; Repetir si quedan bloques
+
+    ; -------------------------------------------------------------------------
+    ; 6. DESCIFRADO (EXTENSION)
+    ; -------------------------------------------------------------------------
+    ; Restaurar IV original para descifrado
+    lea rdi, [iv]
+    mov rax, 0x0123456789ABCDEF     
+    mov [rdi], rax
+
+    ; Calcular número de bloques nuevamente
+    pop rax                         ; Recuperar longitud total (estaba en el stack)
+    push rax                        ; Mantener en stack por si acaso
+    shr rax, 3                      ; Bloques
+    mov rcx, rax
+    
+    lea rsi, [ciphertext]
+    lea rdi, [decrypted_text]
+    call present_decrypt_cbc
+
+    ; -------------------------------------------------------------------------
+    ; 7. MOSTRAR RESULTADO DESCIFRADO
+    ; -------------------------------------------------------------------------
+    mov rax, 1
+    mov rdi, 1
+    lea rsi, [msg_dec_res]
+    mov rdx, len_msg_dec_res
+    syscall
+
+    ; Imprimir texto descifrado
+    mov rax, 1
+    mov rdi, 1
+    lea rsi, [decrypted_text]
+    pop rdx                         ; Longitud total (incluye padding)
+    syscall
+    
+    mov rax, 1
+    mov rdi, 1
+    lea rsi, [newline]
+    mov rdx, 1
+    syscall
 
     ; -------------------------------------------------------------------------
     ; 6. SALIDA
@@ -332,6 +383,9 @@ sBoxLayer:
 
 ; --- CAPA P-LAYER ---
 pLayer:
+    push rbx            ; Guardar RBX (Callee-saved)
+    push rdx            ; Guardar RDX (Usado como índice)
+
     xor rcx, rcx        ; Acumulador para el resultado
     xor rdx, rdx        ; Índice de bit (0..63)
     lea rsi, [pbox]     ; Tabla de permutación
@@ -349,6 +403,132 @@ pLayer:
     jl .ploop
 
     mov rax, rcx        ; Retornar resultado
+    
+    pop rdx             ; Restaurar RDX
+    pop rbx             ; Restaurar RBX
+    ret
+
+; --- CAPA P-LAYER INVERSA ---
+inv_pLayer:
+    push rbx
+    push rdx
+
+    xor rcx, rcx
+    xor rdx, rdx
+    lea rsi, [inv_pbox]
+
+.iploop:
+    bt rax, rdx
+    jnc .iskip
+    movzx rbx, byte [rsi + rdx]
+    bts rcx, rbx
+.iskip:
+    inc rdx
+    cmp rdx, 64
+    jl .iploop
+
+    mov rax, rcx
+    pop rdx
+    pop rbx
+    ret
+
+; --- CAPA S-BOX INVERSA ---
+inv_sBoxLayer:
+    xor rdx, rdx
+    mov rcx, 16
+    lea rsi, [inv_sbox]
+.isloop:
+    mov rbx, rax
+    and rbx, 0x0F
+    mov bl, [rsi + rbx]
+    or rdx, rbx
+    ror rdx, 4
+    ror rax, 4
+    dec rcx
+    jnz .isloop
+    mov rax, rdx
+    ret
+
+; --- DESCIFRADO CBC ---
+present_decrypt_cbc:
+    push rax
+    push rbx
+    push rdx
+    push rsi
+    push rdi
+    push r15
+    push r14
+    
+    mov r15, [iv]       ; Cargar IV inicial
+    
+.cbc_dec_loop:
+    mov rax, [rsi]      ; Leer Ciphertext (C_i)
+    mov r14, rax        ; Guardar C_i para siguiente ronda (IV futuro)
+    
+    call present_decrypt_block ; Decrypt(C_i) -> D(C_i)
+    
+    xor rax, r15        ; P_i = D(C_i) XOR IV_prev
+    mov [rdi], rax      ; Guardar Plaintext
+    
+    mov r15, r14        ; Actualizar IV = C_i
+    
+    add rsi, 8
+    add rdi, 8
+    dec rcx
+    jnz .cbc_dec_loop
+
+    pop r14
+    pop r15
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rbx
+    pop rax
+    ret
+
+; --- DESCIFRAR UN BLOQUE ---
+present_decrypt_block:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+
+    lea rsi, [round_keys]
+    add rsi, 248        ; Apuntar a Key 32 (31 * 8)
+
+    ; Paso 1: AddRoundKey K32
+    mov rbx, [rsi]
+    xor rax, rbx
+    
+    mov rcx, 31         ; Contador de rondas (31 a 1)
+
+.decrypt_loop:
+    sub rsi, 8          ; Apuntar a clave anterior (Ki)
+    
+    push rcx
+    push rsi
+    call inv_pLayer
+    pop rsi
+    pop rcx
+    
+    push rcx
+    push rsi
+    call inv_sBoxLayer
+    pop rsi
+    pop rcx
+    
+    mov rbx, [rsi]      ; Ki
+    xor rax, rbx        ; addRoundKey
+    
+    dec rcx
+    jnz .decrypt_loop
+
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
     ret
 
 ; --- UTILIDAD: PRINT HEX ---
