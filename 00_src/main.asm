@@ -42,6 +42,18 @@ section .data
     msg_dec_res db 10, "[*] Resultado Descifrado (Texto): ", 0
     len_msg_dec_res equ $ - msg_dec_res
     
+    msg_input_prompt db "[*] Ingrese el texto a cifrar (máx 4096 bytes): ", 0
+    len_msg_input_prompt equ $ - msg_input_prompt
+    
+    msg_read_error db "[ERROR] Fallo al leer entrada.", 10, 0
+    len_msg_read_error equ $ - msg_read_error
+    
+    msg_eof db "[INFO] EOF detectado. No hay datos para procesar.", 10, 0
+    len_msg_eof equ $ - msg_eof
+    
+    msg_bytes_read db "[*] Bytes leídos: ", 0
+    len_msg_bytes_read equ $ - msg_bytes_read
+    
     newline db 10, 0
 
 section .bss
@@ -51,9 +63,16 @@ section .bss
     round_keys resq 32     ; Subclaves expandidas
     iv resq 1              ; Vector de Inicialización
     
-    plaintext resb 256     ; Buffer entrada
-    ciphertext resb 256    ; Buffer salida
-    decrypted_text resb 256 ; Buffer descifrado
+    ; Buffers expandidos a 4KB con alineación de cache line (64 bytes)
+    align 64
+    plaintext resb 4096     ; Buffer entrada (4KB)
+    align 64
+    ciphertext resb 4096    ; Buffer salida (4KB)
+    align 64
+    decrypted_text resb 4096 ; Buffer descifrado (4KB)
+    
+    ; Variable para almacenar longitud real leída
+    actual_read_length resq 1  ; Bytes realmente leídos por sys_read
 
 section .text
     global _start
@@ -75,14 +94,30 @@ _start:
     mov rdx, len_msg_orig
     syscall
 
-    ; Imprimir el contenido del mensaje de prueba
+    ; NUEVO: Solicitar entrada al usuario
     mov rax, 1
     mov rdi, 1
-    lea rsi, [test_msg]
-    mov rdx, len_test_msg
+    lea rsi, [msg_input_prompt]
+    mov rdx, len_msg_input_prompt
     syscall
 
-    ; Salto de línea estético
+    ; NUEVO: Leer entrada dinámica desde stdin
+    lea rdi, [plaintext]
+    call read_input_dynamic
+    ; RAX y R12 ahora contienen los bytes leídos
+    ; actual_read_length también tiene el valor
+    
+    ; Mostrar cuántos bytes se leyeron
+    mov rax, 1
+    mov rdi, 1
+    lea rsi, [msg_bytes_read]
+    mov rdx, len_msg_bytes_read
+    syscall
+    
+    mov rax, r12            ; Recuperar bytes leídos
+    call print_decimal      ; Imprimir número
+    
+    ; Salto de línea
     mov rax, 1
     mov rdi, 1
     lea rsi, [newline]
@@ -106,15 +141,12 @@ _start:
     ; -------------------------------------------------------------------------
     ; 3. PREPARACIÓN Y PADDING
     ; -------------------------------------------------------------------------
-    ; Copiar mensaje de prueba al buffer de trabajo
-    lea rsi, [test_msg]
-    lea rdi, [plaintext]
-    mov rcx, len_test_msg
-    rep movsb                       
+    ; Ya NO necesitamos copiar el mensaje de prueba porque ya está en plaintext
+    ; desde read_input_dynamic
 
     ; Aplicar Padding PKCS#7
     lea rdi, [plaintext]            ; Inicio buffer
-    mov rsi, len_test_msg           ; Longitud original
+    mov rsi, r12                    ; Longitud original (bytes leídos)
     call apply_padding
     
     ; RAX devuelve la NUEVA longitud total. La guardamos.
@@ -150,10 +182,11 @@ _start:
     syscall
 
     ; Bucle para imprimir TODOS los bloques cifrados
+    ; IMPORTANTE: Usa RCX (64-bit) para soportar > 255 bloques
     pop rax                         ; Recuperar longitud total en bytes
     push rax                        ; Guardarla de nuevo para el descifrado
-    shr rax, 3                      ; Convertir a número de bloques
-    mov rcx, rax                    ; Usar como contador del bucle
+    shr rax, 3                      ; Convertir a número de bloques (dividir por 8)
+    mov rcx, rax                    ; RCX = contador de bloques (64-bit)
     lea rsi, [ciphertext]           ; Puntero al inicio del resultado
 
 .print_loop:
@@ -166,8 +199,9 @@ _start:
     pop rsi                         ; Recuperar puntero
     pop rcx                         ; Recuperar contador
     
-    add rsi, 8                      ; Avanzar al siguiente bloque
-    dec rcx                         
+    add rsi, 8                      ; Avanzar al siguiente bloque (64-bit)
+    dec rcx                         ; Decrementar contador (64-bit)
+                                    ; CRÍTICO: RCX soporta > 255 iteraciones
     jnz .print_loop                 ; Repetir si quedan bloques
 
     ; -------------------------------------------------------------------------
@@ -223,28 +257,192 @@ _start:
 ; =============================================================================
 
 ; --- PADDING PKCS#7 ---
+; Task A (Benjamín): Padding Calculation Adaptation
 ; Calcula cuánto falta para múltiplo de 8 y rellena con ese valor.
+; IMPORTANTE: Usa aritmética de 64 bits para soportar buffers grandes (hasta 4KB)
+; Entrada: RDI = puntero al buffer
+;          RSI = longitud actual del mensaje (64-bit, puede ser > 255)
+; Salida:  RAX = nueva longitud total (original + padding)
+; Registros modificados: RAX, RCX, RDX
 apply_padding:
-    mov rax, rsi        ; Longitud actual
-    and rax, 7          ; Modulo 8
+    ; Paso 1: Calcular padding necesario usando aritmética de 64 bits
+    ; Fórmula: pad_size = 8 - (length % 8)
+    ; Si length % 8 == 0, entonces pad_size = 8 (siempre agregamos padding)
     
-    mov rcx, 8
-    sub rcx, rax        ; Bytes a agregar (Pad Size)
+    mov rax, rsi        ; RAX = Longitud actual (64-bit completo)
+    and rax, 7          ; RAX = length % 8 (usando AND para modulo rápido)
+                        ; Esto funciona porque 8 = 2^3, entonces % 8 = AND 7
     
-    mov rdx, rcx        ; Guardar el valor del byte de relleno
-    add rdi, rsi        ; Mover puntero al final del mensaje
-
-    mov al, dl          ; Valor a escribir
+    ; Paso 2: Calcular bytes a agregar
+    mov rcx, 8          ; RCX = 8 (tamaño de bloque)
+    sub rcx, rax        ; RCX = 8 - (length % 8) = pad_size
+                        ; RCX ahora contiene el número de bytes de padding (1-8)
+    
+    ; Paso 3: Guardar el valor del byte de relleno
+    mov rdx, rcx        ; RDX = pad_size (valor que se escribirá en cada byte)
+    
+    ; Paso 4: Calcular posición final del mensaje
+    ; CRÍTICO: Usar ADD de 64 bits para soportar offsets grandes
+    add rdi, rsi        ; RDI = base_address + actual_length
+                        ; Ahora RDI apunta al primer byte después del mensaje
+    
+    ; Paso 5: Escribir bytes de padding
+    ; Nota: Usamos AL (8-bit) solo para ESCRIBIR bytes individuales,
+    ; pero el CONTADOR (RCX) es de 64 bits para soportar loops grandes
+    mov al, dl          ; AL = valor del byte de padding (1-8)
+    
 .pad_loop:
-    mov [rdi], al       ; Escribir byte
-    inc rdi
-    dec rcx
-    jnz .pad_loop
+    mov [rdi], al       ; Escribir byte de padding
+    inc rdi             ; Avanzar puntero (64-bit)
+    dec rcx             ; Decrementar contador (64-bit)
+    jnz .pad_loop       ; Continuar si RCX != 0
+    
+    ; Paso 6: Calcular y retornar nueva longitud total
+    ; CRÍTICO: Usar LEA de 64 bits para soportar longitudes grandes
+    lea rax, [rsi + rdx] ; RAX = original_length + pad_size
+                         ; Retorna la nueva longitud total
+    ret
 
-    lea rax, [rsi + rdx] ; Retornar nueva longitud total
+; --- LECTURA DINÁMICA CON MANEJO DE ERRORES ---
+; Task A (Carlos): Dynamic Read Logic (sys_read)
+; Lee datos desde stdin con manejo completo de errores
+; Entrada: RDI = puntero al buffer de destino
+; Salida: RAX = bytes leídos (o código de error)
+;         R12 = bytes leídos (preservado para uso posterior)
+;         actual_read_length = bytes leídos (guardado en memoria)
+read_input_dynamic:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    
+    ; Guardar puntero al buffer
+    mov r12, rdi
+    
+    ; Preparar sys_read
+    mov rax, 0              ; sys_read
+    mov rdi, 0              ; stdin
+    mov rsi, r12            ; buffer destino
+    mov rdx, 4096           ; máximo a leer (4KB)
+    syscall
+    
+    ; Verificar resultado en RAX
+    cmp rax, 0
+    jl .read_error          ; Si RAX < 0, error de lectura
+    je .read_eof            ; Si RAX == 0, EOF
+    
+    ; Lectura exitosa
+    mov r12, rax            ; Guardar bytes leídos en R12
+    lea rbx, [actual_read_length]
+    mov [rbx], rax          ; Guardar en memoria también
+    
+    ; Restaurar registros y retornar
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+    
+.read_error:
+    ; Manejar error de lectura
+    push rax                ; Guardar código de error
+    
+    mov rax, 1              ; sys_write
+    mov rdi, 1              ; stdout
+    lea rsi, [msg_read_error]
+    mov rdx, len_msg_read_error
+    syscall
+    
+    pop rax                 ; Recuperar código de error
+    mov rax, 60             ; sys_exit
+    mov rdi, 1              ; exit code 1 (error)
+    syscall
+    
+.read_eof:
+    ; Manejar EOF (sin datos)
+    mov rax, 1              ; sys_write
+    mov rdi, 1              ; stdout
+    lea rsi, [msg_eof]
+    mov rdx, len_msg_eof
+    syscall
+    
+    mov rax, 60             ; sys_exit
+    xor rdi, rdi            ; exit code 0 (normal)
+    syscall
+
+; --- UTILIDAD: IMPRIMIR NÚMERO DECIMAL ---
+; Imprime el valor en RAX como número decimal
+; Entrada: RAX = número a imprimir
+print_decimal:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    
+    mov rcx, 0              ; Contador de dígitos
+    mov rbx, 10             ; Base decimal
+    
+    ; Caso especial: si es 0
+    cmp rax, 0
+    jne .convert_loop
+    
+    push '0'
+    inc rcx
+    jmp .print_digits
+    
+.convert_loop:
+    cmp rax, 0
+    je .print_digits
+    
+    xor rdx, rdx            ; Limpiar RDX para división
+    div rbx                 ; RAX = RAX / 10, RDX = RAX % 10
+    add rdx, '0'            ; Convertir a ASCII
+    push rdx                ; Guardar dígito en stack
+    inc rcx
+    jmp .convert_loop
+    
+.print_digits:
+    cmp rcx, 0
+    je .done
+    
+    pop rdx                 ; Obtener dígito
+    push rcx                ; Proteger contador
+    push rdx                ; Poner dígito en stack para imprimir
+    
+    mov rax, 1              ; sys_write
+    mov rdi, 1              ; stdout
+    mov rsi, rsp            ; Apuntar al dígito en stack
+    mov rdx, 1              ; 1 byte
+    syscall
+    
+    pop rdx                 ; Limpiar stack
+    pop rcx                 ; Recuperar contador
+    dec rcx
+    jmp .print_digits
+    
+.done:
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
     ret
 
 ; --- MODO CBC ---
+; Joint Task (Pair Programming): Register Audit
+; Cifrado en modo CBC (Cipher Block Chaining)
+; IMPORTANTE: Usa RCX (64-bit) como contador de bloques para soportar
+;             archivos grandes (4KB = 512 bloques de 8 bytes)
+; Entrada: RSI = puntero al plaintext
+;          RDI = puntero al buffer de salida (ciphertext)
+;          RCX = número de bloques a cifrar (64-bit, puede ser > 255)
+;          [iv] = Vector de Inicialización
+; Salida:  Ciphertext escrito en el buffer apuntado por RDI
 present_encrypt_cbc:
     push rax
     push rbx
@@ -255,15 +453,16 @@ present_encrypt_cbc:
     mov r15, [iv]       ; Cargar IV inicial
 
 .cbc_loop:
-    mov rax, [rsi]      ; Leer Plaintext
+    mov rax, [rsi]      ; Leer Plaintext (8 bytes)
     xor rax, r15        ; XOR con (IV o Bloque Anterior)
     call present_encrypt_block
-    mov [rdi], rax      ; Guardar Ciphertext
-    mov r15, rax        ; Actualizar feedback
-    add rsi, 8
-    add rdi, 8
-    dec rcx
-    jnz .cbc_loop
+    mov [rdi], rax      ; Guardar Ciphertext (8 bytes)
+    mov r15, rax        ; Actualizar feedback para siguiente bloque
+    add rsi, 8          ; Avanzar puntero de entrada (64-bit)
+    add rdi, 8          ; Avanzar puntero de salida (64-bit)
+    dec rcx             ; Decrementar contador de bloques (64-bit)
+                        ; CRÍTICO: RCX es 64-bit, soporta > 255 bloques
+    jnz .cbc_loop       ; Continuar si quedan bloques
 
     pop r15
     pop rdi
@@ -450,6 +649,15 @@ inv_sBoxLayer:
     ret
 
 ; --- DESCIFRADO CBC ---
+; Joint Task (Pair Programming): Register Audit
+; Descifrado en modo CBC (Cipher Block Chaining)
+; IMPORTANTE: Usa RCX (64-bit) como contador de bloques para soportar
+;             archivos grandes (4KB = 512 bloques de 8 bytes)
+; Entrada: RSI = puntero al ciphertext
+;          RDI = puntero al buffer de salida (plaintext)
+;          RCX = número de bloques a descifrar (64-bit, puede ser > 255)
+;          [iv] = Vector de Inicialización
+; Salida:  Plaintext escrito en el buffer apuntado por RDI
 present_decrypt_cbc:
     push rax
     push rbx
@@ -462,20 +670,21 @@ present_decrypt_cbc:
     mov r15, [iv]       ; Cargar IV inicial
     
 .cbc_dec_loop:
-    mov rax, [rsi]      ; Leer Ciphertext (C_i)
+    mov rax, [rsi]      ; Leer Ciphertext (C_i) - 8 bytes
     mov r14, rax        ; Guardar C_i para siguiente ronda (IV futuro)
     
     call present_decrypt_block ; Decrypt(C_i) -> D(C_i)
     
     xor rax, r15        ; P_i = D(C_i) XOR IV_prev
-    mov [rdi], rax      ; Guardar Plaintext
+    mov [rdi], rax      ; Guardar Plaintext (8 bytes)
     
     mov r15, r14        ; Actualizar IV = C_i
     
-    add rsi, 8
-    add rdi, 8
-    dec rcx
-    jnz .cbc_dec_loop
+    add rsi, 8          ; Avanzar puntero de entrada (64-bit)
+    add rdi, 8          ; Avanzar puntero de salida (64-bit)
+    dec rcx             ; Decrementar contador de bloques (64-bit)
+                        ; CRÍTICO: RCX es 64-bit, soporta > 255 bloques
+    jnz .cbc_dec_loop   ; Continuar si quedan bloques
 
     pop r14
     pop r15
