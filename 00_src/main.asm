@@ -54,6 +54,19 @@ section .data
     msg_bytes_read db "[*] Bytes leídos: ", 0
     len_msg_bytes_read equ $ - msg_bytes_read
     
+    ; Mensajes para manejo de archivos (Phase 11)
+    msg_usage db "Uso: ./present <archivo>", 10, "Ejemplo: ./present input.txt", 10, 0
+    len_msg_usage equ $ - msg_usage
+    
+    msg_file_open db "[*] Abriendo archivo: ", 0
+    len_msg_file_open equ $ - msg_file_open
+    
+    msg_file_error db "[ERROR] No se pudo abrir el archivo.", 10, 0
+    len_msg_file_error equ $ - msg_file_error
+    
+    msg_file_success db "[*] Archivo abierto exitosamente.", 10, 0
+    len_msg_file_success equ $ - msg_file_success
+    
     newline db 10, 0
 
 section .bss
@@ -73,18 +86,91 @@ section .bss
     
     ; Variable para almacenar longitud real leída
     actual_read_length resq 1  ; Bytes realmente leídos por sys_read
+    
+    ; Variable para almacenar el file descriptor (Phase 11)
+    file_descriptor resq 1     ; FD del archivo abierto
 
 section .text
     global _start
 
 _start:
     ; -------------------------------------------------------------------------
-    ; 1. IMPRIMIR HEADER Y MENSAJE ORIGINAL
+    ; PHASE 11 - Task A: Command Line Argument Parsing (argv)
+    ; -------------------------------------------------------------------------
+    ; Stack structure at startup:
+    ;   [rsp]     = argc (number of arguments)
+    ;   [rsp+8]   = argv[0] (program name)
+    ;   [rsp+16]  = argv[1] (first argument - filename)
+    ; -------------------------------------------------------------------------
+    
+    ; Paso 1: Verificar argc
+    mov rax, [rsp]              ; RAX = argc
+    cmp rax, 2                  ; ¿Tenemos al menos 2 argumentos?
+    jl .show_usage              ; Si argc < 2, mostrar uso y salir
+    
+    ; Paso 2: Obtener puntero al filename (argv[1])
+    mov r13, [rsp + 16]         ; R13 = argv[1] (puntero al filename)
+                                ; R13 se usará durante todo el programa
+    
+    ; -------------------------------------------------------------------------
+    ; 1. IMPRIMIR HEADER
     ; -------------------------------------------------------------------------
     mov rax, 1              ; sys_write
     mov rdi, 1              ; stdout
     lea rsi, [msg_start]
     mov rdx, len_msg_start
+    syscall
+
+    ; -------------------------------------------------------------------------
+    ; PHASE 11 - Task B: Implement sys_open
+    ; -------------------------------------------------------------------------
+    ; Mostrar mensaje de apertura de archivo
+    mov rax, 1
+    mov rdi, 1
+    lea rsi, [msg_file_open]
+    mov rdx, len_msg_file_open
+    syscall
+    
+    ; Calcular longitud del filename
+    mov rsi, r13                ; Filename
+    call strlen                 ; RAX = longitud
+    mov r15, rax                ; Guardar longitud en R15
+    
+    ; Imprimir nombre del archivo
+    mov rax, 1
+    mov rdi, 1
+    mov rsi, r13                ; Filename desde argv[1]
+    mov rdx, r15                ; Longitud calculada
+    syscall
+    
+    ; Salto de línea
+    mov rax, 1
+    mov rdi, 1
+    lea rsi, [newline]
+    mov rdx, 1
+    syscall
+    
+    ; Abrir el archivo
+    mov rax, 2                  ; sys_open
+    mov rdi, r13                ; Filename (argv[1])
+    mov rsi, 0                  ; Flags: O_RDONLY (solo lectura)
+    mov rdx, 0                  ; Mode: no importa para lectura
+    syscall
+    
+    ; Verificar resultado
+    cmp rax, 0
+    jl .file_open_error         ; Si RAX < 0, error al abrir
+    
+    ; Guardar file descriptor
+    mov r14, rax                ; R14 = File Descriptor
+    lea rbx, [file_descriptor]
+    mov [rbx], rax              ; Guardar en memoria también
+    
+    ; Mostrar mensaje de éxito
+    mov rax, 1
+    mov rdi, 1
+    lea rsi, [msg_file_success]
+    mov rdx, len_msg_file_success
     syscall
 
     ; Imprimir etiqueta "Mensaje Original: "
@@ -94,18 +180,23 @@ _start:
     mov rdx, len_msg_orig
     syscall
 
-    ; NUEVO: Solicitar entrada al usuario
-    mov rax, 1
-    mov rdi, 1
-    lea rsi, [msg_input_prompt]
-    mov rdx, len_msg_input_prompt
-    syscall
-
-    ; NUEVO: Leer entrada dinámica desde stdin
-    lea rdi, [plaintext]
+    ; -------------------------------------------------------------------------
+    ; PHASE 11 - Task C: Refactor read_input_dynamic
+    ; -------------------------------------------------------------------------
+    ; Leer contenido del archivo usando el FD en R14
+    mov rdi, r14                ; Pasar FD como primer argumento
+    lea rsi, [plaintext]        ; Buffer de destino como segundo argumento
     call read_input_dynamic
     ; RAX y R12 ahora contienen los bytes leídos
     ; actual_read_length también tiene el valor
+    
+    ; -------------------------------------------------------------------------
+    ; PHASE 11 - Task D: Implement sys_close
+    ; -------------------------------------------------------------------------
+    ; Cerrar el archivo después de leer
+    mov rax, 3                  ; sys_close
+    mov rdi, r14                ; FD del archivo
+    syscall
     
     ; Mostrar cuántos bytes se leyeron
     mov rax, 1
@@ -245,10 +336,40 @@ _start:
     syscall
 
     ; -------------------------------------------------------------------------
-    ; 6. SALIDA
+    ; 8. SALIDA NORMAL
     ; -------------------------------------------------------------------------
     mov rax, 60                     ; sys_exit
     xor rdi, rdi                    ; código 0
+    syscall
+
+; =============================================================================
+; MANEJADORES DE ERROR (PHASE 11)
+; =============================================================================
+
+.show_usage:
+    ; Mostrar mensaje de uso cuando no se proporciona archivo
+    mov rax, 1
+    mov rdi, 1
+    lea rsi, [msg_usage]
+    mov rdx, len_msg_usage
+    syscall
+    
+    ; Salir con código de error
+    mov rax, 60
+    mov rdi, 1                      ; exit code 1
+    syscall
+
+.file_open_error:
+    ; Mostrar mensaje de error al abrir archivo
+    mov rax, 1
+    mov rdi, 1
+    lea rsi, [msg_file_error]
+    mov rdx, len_msg_file_error
+    syscall
+    
+    ; Salir con código de error
+    mov rax, 60
+    mov rdi, 2                      ; exit code 2 (file error)
     syscall
 
 
@@ -304,9 +425,10 @@ apply_padding:
     ret
 
 ; --- LECTURA DINÁMICA CON MANEJO DE ERRORES ---
-; Task A (Carlos): Dynamic Read Logic (sys_read)
-; Lee datos desde stdin con manejo completo de errores
-; Entrada: RDI = puntero al buffer de destino
+; PHASE 11 - Task C: Refactor read_input_dynamic
+; Lee datos desde un file descriptor con manejo completo de errores
+; Entrada: RDI = file descriptor (0 para stdin, o FD de archivo)
+;          RSI = puntero al buffer de destino
 ; Salida: RAX = bytes leídos (o código de error)
 ;         R12 = bytes leídos (preservado para uso posterior)
 ;         actual_read_length = bytes leídos (guardado en memoria)
@@ -317,13 +439,14 @@ read_input_dynamic:
     push rsi
     push rdi
     
-    ; Guardar puntero al buffer
-    mov r12, rdi
+    ; Guardar argumentos
+    mov r15, rdi                ; R15 = File Descriptor
+    mov r12, rsi                ; R12 = Buffer pointer
     
     ; Preparar sys_read
     mov rax, 0              ; sys_read
-    mov rdi, 0              ; stdin
-    mov rsi, r12            ; buffer destino
+    mov rdi, r15            ; File descriptor (parámetro de entrada)
+    mov rsi, r12            ; buffer destino (parámetro de entrada)
     mov rdx, 4096           ; máximo a leer (4KB)
     syscall
     
@@ -431,6 +554,28 @@ print_decimal:
     pop rcx
     pop rbx
     pop rax
+    ret
+
+; --- UTILIDAD: CALCULAR LONGITUD DE STRING ---
+; Calcula la longitud de un string terminado en null
+; Entrada: RSI = puntero al string
+; Salida: RAX = longitud del string (sin contar el null)
+strlen:
+    push rsi
+    push rcx
+    
+    xor rax, rax            ; Contador = 0
+    
+.strlen_loop:
+    cmp byte [rsi], 0       ; ¿Es null terminator?
+    je .strlen_done
+    inc rsi
+    inc rax
+    jmp .strlen_loop
+    
+.strlen_done:
+    pop rcx
+    pop rsi
     ret
 
 ; --- MODO CBC ---
